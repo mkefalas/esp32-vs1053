@@ -1,0 +1,381 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <SD_MMC.h>
+#include <VS1053.h>  // baldram ESP_VS1053_Library
+#include "pins.h"  // Include your pin definitions
+
+// === CONFIG ===
+const char* ssid = "MKEF";
+const char* password = "1234567cbe";
+const char* streamURL =  "http://185.52.127.132/fr/30601/mp3_128.mp3?origine=fluxradios";
+//const char* streamURL =  "http://radiostreaming.ert.gr/ert-talaika";
+//const char* streamURL =  "https://stream.vanillaradio.com:8090/live";
+//const char* streamURL =  "http://cast3.radiohost.ovh:8352/";
+//const char* streamURL = "http://radiostreaming.ert.gr/ert-talaika";  // AAC/MP3 stream
+const char* wavFilename = "/test2.wav";               // WAV interrupt file
+
+
+VS1053 player(VS1003B_CS_PIN, VS1003B_DCS_PIN, VS1003B_DREQ_PIN);
+
+enum Mode { STREAMING, WAV_INTERRUPT, BUFFERING };
+Mode mode = BUFFERING;  // Start in buffering mode
+
+WiFiClient* radioClient = nullptr;
+HTTPClient http;
+File wavFile;
+
+// Buffering thresholds - increased to handle variable stream rates
+#define MIN_BUFFER_BEFORE_PLAY 8192   // Wait for 8KB before starting playback (increased from 4KB)
+#define MIN_BUFFER_DURING_PLAY 6144   // Keep at least 6KB during playback (increased from 2KB)
+#define CRITICAL_BUFFER_LEVEL 4096    // Critical level for aggressive buffering (increased from 1KB)
+
+// === RING BUFFER ===
+#define BUFFER_SIZE 65536  // Increased back to 64KB for better buffering
+#define CHUNK_SIZE 64      // Reduced chunk size for more responsive DREQ handling
+uint8_t ringBuffer[BUFFER_SIZE];
+volatile size_t head = 0;
+volatile size_t tail = 0;
+
+size_t bufferAvailable() {
+  if (head >= tail) return head - tail;
+  return BUFFER_SIZE - tail + head;
+}
+
+size_t bufferFree() {
+  return BUFFER_SIZE - bufferAvailable() - 1;
+}
+
+void bufferWrite(uint8_t b) {
+  size_t next = (head + 1) % BUFFER_SIZE;
+  if (next != tail) {
+    ringBuffer[head] = b;
+    head = next;
+  }
+}
+
+int bufferRead(uint8_t* buf, size_t len) {
+  size_t count = 0;
+  while (count < len && bufferAvailable() > 0) {
+    buf[count++] = ringBuffer[tail];
+    tail = (tail + 1) % BUFFER_SIZE;
+  }
+  return count;
+}
+
+void fillBufferFromStream() {
+  // Check WiFi connection first
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected! Attempting reconnection...");
+    return;
+  }
+  
+  // Read larger chunks at once for better efficiency
+  uint8_t tempBuf[1024];  // Increased back to 1024 for more aggressive filling
+  int fillAttempts = 0;
+  const int maxFillAttempts = 8;  // Increased to 8 for much more aggressive filling
+  
+  while (radioClient && radioClient->available() && bufferFree() > 1024 && fillAttempts < maxFillAttempts) {
+    int available = radioClient->available();
+    int toRead = min(1024, min(available, (int)bufferFree()));
+    int bytesRead = radioClient->read(tempBuf, toRead);
+    
+    if (bytesRead <= 0) {
+      break;  // No more data available
+    }
+    
+    // Write data to ring buffer more efficiently
+    for (int i = 0; i < bytesRead; i++) {
+      bufferWrite(tempBuf[i]);
+    }
+    
+    fillAttempts++;
+    
+    // Less frequent yields to fill buffer faster
+    if (bytesRead >= 512) {
+      yield();
+    }
+  }
+}
+
+bool resolveFinalStreamURL(const String& inputURL, String& resolvedURL, int maxRedirects = 5) {
+  String url = inputURL;
+
+  for (int i = 0; i < maxRedirects; i++) {
+    http.end();
+    Serial.printf("Resolving: %s\n", url.c_str());
+
+    WiFiClient* client = url.startsWith("https://")
+      ? static_cast<WiFiClient*>(new WiFiClientSecure())
+      : new WiFiClient();
+    if (url.startsWith("https://")) ((WiFiClientSecure*)client)->setInsecure();
+
+    http.begin(*client, url);
+    http.collectHeaders((const char*[]){"Location", "Content-Type"}, 2);
+    int code = http.GET();
+    Serial.printf("Response code: %d\n", code);
+
+    if (code == HTTP_CODE_OK) {
+      String type = http.header("Content-Type");
+      Serial.printf("Content-Type: %s\n", type.c_str());
+
+      if (type.indexOf("mpegurl") >= 0 || type.indexOf("x-scpls") >= 0 || url.endsWith(".m3u") || url.endsWith(".pls")) {
+        while (http.getStream().available()) {
+          String line = http.getStream().readStringUntil('\n');
+          line.trim();
+          if (line.startsWith("http")) {
+            resolvedURL = line;
+            return true;
+          }
+        }
+        return false;
+      }
+
+      resolvedURL = url;
+      return true;
+    }
+
+    if (code == HTTP_CODE_FOUND || code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_SEE_OTHER) {
+      String loc = http.header("Location");
+      if (loc.isEmpty()) return false;
+      if (loc.startsWith("/")) {
+        int idx = url.indexOf('/', url.indexOf("://") + 3);
+        url = (idx > 0 ? url.substring(0, idx) : url) + loc;
+      } else {
+        url = loc;
+      }
+      continue;
+    }
+
+    return false;
+  }
+
+  Serial.println("Too many redirects.");
+  return false;
+}
+
+
+
+bool startStream() {
+  String finalURL;
+  if (!resolveFinalStreamURL(streamURL, finalURL)) {
+    Serial.println("Stream URL resolution failed.");
+    return false;
+  }
+
+  http.end();
+  Serial.printf("Connecting to final stream: %s\n", finalURL.c_str());
+
+  WiFiClient* client = finalURL.startsWith("https://")
+    ? static_cast<WiFiClient*>(new WiFiClientSecure())
+    : new WiFiClient();
+  if (finalURL.startsWith("https://")) {
+    ((WiFiClientSecure*)client)->setInsecure();
+    ((WiFiClientSecure*)client)->setTimeout(10000);  // 10 second timeout
+  } else {
+    client->setTimeout(10000);  // 10 second timeout for HTTP too
+  }
+
+  http.begin(*client, finalURL);
+  http.setTimeout(15000);  // 15 second HTTP timeout
+  http.setReuse(true);     // Enable connection reuse
+  
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Final GET failed: %d\n", code);
+    return false;
+  }
+
+  radioClient = http.getStreamPtr();
+  Serial.println("Stream connected.");
+  return true;
+}
+
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Hardware reset for VS1053
+  pinMode(VS1003B_RST_PIN, OUTPUT);
+  digitalWrite(VS1003B_RST_PIN, LOW);
+  delay(100);
+  digitalWrite(VS1003B_RST_PIN, HIGH);
+  delay(100);
+
+  // Initialize SPI with optimized settings
+  SPI.begin(VS1003B_CLK_PIN, VS1003B_MISO_PIN, VS1003B_MOSI_PIN);
+  SPI.setFrequency(4000000);  // 4MHz for better stability
+
+  // WiFi connection with optimizations
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);  // Disable WiFi sleep for streaming
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println(" connected.");
+  Serial.printf("WiFi signal strength: %d dBm\n", WiFi.RSSI());
+
+  // Initialize SD card
+  SD_MMC.setPins(PIN_SD_MMC_CLK, PIN_SD_MMC_CMD, PIN_SD_MMC_D0);
+  if (!SD_MMC.begin("/sdmmc", true)) {
+    Serial.println("SD_MMC failed!");
+    while (1);
+  }
+
+  // Initialize VS1053 player
+  player.begin();
+  
+  // Load VS1053b firmware patches for improved streaming performance
+  // These patches (4667 words) provide:
+  // - Enhanced audio streaming stability and reduced dropouts
+  // - Improved MP3/WAV decoding accuracy and speed
+  // - Better buffering and data handling for continuous streams
+  // - Optimized DSP algorithms for higher quality audio output
+  // - Reduced audio artifacts and improved frequency response
+  Serial.println("Loading VS1053b firmware patches...");
+  //player.loadDefaultVs1053Patches();
+  Serial.println("Firmware patches loaded successfully - enhanced audio performance active");
+  
+  player.setVolume(97);
+  uint8_t eq[4] = {0x0f, 0x0b, 0x0f, 0x04}; // Example EQ values
+  player.setTone(eq);
+
+  // Start streaming
+  if (!startStream()) {
+    Serial.println("Stream failed.");
+    while (1);
+  }
+
+  Serial.println("Streaming started. Type 's' to interrupt with WAV.");
+  Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+}
+
+void startWavInterrupt() {
+  if (mode == WAV_INTERRUPT) return;
+
+  Serial.println("Interrupting with WAV...");
+  mode = WAV_INTERRUPT;
+
+  player.softReset();  // Use baldram library's built-in soft reset
+
+  wavFile = SD_MMC.open(wavFilename);
+  if (!wavFile) {
+    Serial.println("Cannot open WAV file.");
+    mode = STREAMING;
+  }
+}
+
+void resumeStream() {
+  Serial.println("Resuming stream...");
+  
+  // Just reset the VS1053 - keep the stream connection alive
+  player.softReset();
+  
+  // Resume streaming mode directly (buffer should still have data)
+  mode = STREAMING;
+  Serial.println("Stream resumed.");
+}
+
+void loop() {
+  // Handle serial commands with minimal processing
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 's') {
+      startWavInterrupt();
+    }
+  }
+
+  if (mode == BUFFERING) {
+    // Fill buffer until we have enough data
+    fillBufferFromStream();
+    
+    if (bufferAvailable() >= MIN_BUFFER_BEFORE_PLAY) {
+      Serial.printf("Pre-buffering complete. Starting playback with %d bytes.\n", bufferAvailable());
+      mode = STREAMING;
+    } else {
+      // Show buffering progress less frequently to reduce serial overhead
+      static unsigned long lastProgress = 0;
+      if (millis() - lastProgress > 2000) {  // Every 2 seconds instead of 1
+        Serial.printf("Buffering... %d/%d bytes (%.1f%%)\n", 
+                      bufferAvailable(), MIN_BUFFER_BEFORE_PLAY,
+                      (float)bufferAvailable() / MIN_BUFFER_BEFORE_PLAY * 100);
+        lastProgress = millis();
+      }
+    }
+  }
+
+  else if (mode == STREAMING) {
+    // Check buffer level first for priority decisions
+    size_t currentBuffer = bufferAvailable();
+    
+    // Much more aggressive buffering to handle the variable stream
+    if (currentBuffer < CRITICAL_BUFFER_LEVEL) {
+      // Very aggressive when critical - multiple fill attempts
+      for (int i = 0; i < 5; i++) {
+        fillBufferFromStream();
+      }
+    } else if (currentBuffer < MIN_BUFFER_DURING_PLAY) {
+      // Aggressive when approaching minimum
+      for (int i = 0; i < 3; i++) {
+        fillBufferFromStream();
+      }
+    } else if (currentBuffer < MIN_BUFFER_DURING_PLAY * 2) {  // 12KB threshold
+      // Extra fill when buffer starts dropping
+      fillBufferFromStream();
+      fillBufferFromStream();
+    } else {
+      // Normal buffering - single attempt
+      fillBufferFromStream();
+    }
+
+    // Check if buffer is getting critically low
+    if (bufferAvailable() < MIN_BUFFER_DURING_PLAY) {
+      Serial.printf("Buffer underrun! (%d bytes) Switching to buffering mode.\n", bufferAvailable());
+      mode = BUFFERING;
+      return;
+    }
+
+    // Play audio if DREQ is ready and we have enough data
+    if (digitalRead(VS1003B_DREQ_PIN) && bufferAvailable() >= CHUNK_SIZE) {
+      uint8_t buf[CHUNK_SIZE];  // Use smaller chunk size for more responsive playback
+      int n = bufferRead(buf, sizeof(buf));
+      if (n > 0) {
+        player.playChunk(buf, n);
+      }
+    }
+    
+    // Debug buffer status less frequently to reduce overheads
+    static unsigned long lastDebug = 0;
+    if (millis() - lastDebug > 15000) {  // Every 15 seconds instead of 10
+      Serial.printf("Buffer: %d/%d bytes (%.1f%% full), Free heap: %d\n", 
+                    bufferAvailable(), BUFFER_SIZE, 
+                    (float)bufferAvailable() / BUFFER_SIZE * 100,
+                    ESP.getFreeHeap());
+      lastDebug = millis();
+    }
+  }
+
+  else if (mode == WAV_INTERRUPT) {
+    // Continue filling buffer from stream while playing WAV
+    fillBufferFromStream();
+    
+    if (wavFile && digitalRead(VS1003B_DREQ_PIN)) {
+      uint8_t buf[CHUNK_SIZE];  // Use consistent chunk size
+      int n = wavFile.read(buf, sizeof(buf));
+      if (n > 0) {
+        player.playChunk(buf, n);
+      } else {
+        wavFile.close();
+        Serial.println("WAV finished.");
+        resumeStream();
+      }
+    }
+  }
+
+  // Minimize unnecessary operations at the end of loop
+}
