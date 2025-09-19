@@ -6,7 +6,7 @@
 #include <Adafruit_SSD1306.h>
 #include <Fonts/FreeMonoBold12pt7b.h>
 #include <Fonts/FreeMonoBold9pt7b.h>
-#include "AudioTask.h"
+#include "../../AudioTask.h"
 #include "keypadDriver.h"
 #include "optoInDriver.h"
 #include "setupDriver.h"
